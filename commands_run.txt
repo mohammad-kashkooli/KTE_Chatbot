@@ -1,0 +1,24 @@
+1. setx OPENAI_API_KEY "sk-....." in cmd   setx OPENAI_BASE_URL "https://api.gapgpt.app/v1"
+
+2. ollama pull nomic-embed-text or bge-m3:latest
+3. ollama pull gemma2:9b or gemma3:4b
+4. set KTE_DEBUG=1 # to see messages related which backend model used for embedding
+
+
+4.python kte_proposal.py original_article.pdf --help
+usage: kte_proposal.py [-h] [--model {gpt-4o-mini,gpt-4o,gemma2,llama3.1:8b-instruct,mistral:7b-instruct}] file
+
+Extract KTE messages from a medical article using RAG+HyDE
+
+positional arguments:
+  file                  PDF or DOCX article
+
+options:
+  -h, --help            show this help message and exit
+  --model {gpt-4o-mini,gpt-4o,gemma2,llama3.1:8b-instruct,mistral:7b-instruct}
+                        Which LLM backend to use
+
+OR
+
+4.streamlit run streamlit_kte_app.py
+
