@@ -33,6 +33,7 @@ import io
 import re
 import json
 import base64
+import math
 import tempfile
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple
@@ -60,6 +61,7 @@ from jinja2 import Template
 
 # RAG helpers from your generator module
 from kte_proposal import load_document, split_sections, build_vectordb  # reuse same pipeline
+from kte_proposal import assign_pids, format_context, validate_citations, sanitize_citations
 
 # -----------------------------
 # Field mappings & UI constants
@@ -163,14 +165,95 @@ def _safe_to_dict(obj: Any) -> Dict[str, Any]:
     return {"raw": repr(obj)}
 
 
+
+def _apply_pdf_image_settings_from_state() -> None:
+    """
+    UI-controlled PDF image handling.
+    We keep compatibility with the generator by passing settings via env vars.
+    """
+    mode = (st.session_state.get("pdf_img_mode") or os.getenv("KTE_PDF_IMAGE_MODE", "none")).strip().lower()
+    if mode not in {"none", "auto", "ocr", "vision"}:
+        mode = "none"
+
+    def _f(name: str, env_name: str, default: float) -> float:
+        v = st.session_state.get(name, None)
+        if v is None:
+            try:
+                return float(os.getenv(env_name, str(default)))
+            except Exception:
+                return default
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _i(name: str, env_name: str, default: int) -> int:
+        v = st.session_state.get(name, None)
+        if v is None:
+            try:
+                return int(os.getenv(env_name, str(default)))
+            except Exception:
+                return default
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    
+    min_area = max(0.0, min(1.0, _f("pdf_img_min_area", "KTE_PDF_IMAGE_MIN_AREA", 0.08)))
+    max_regions = max(1, _i("pdf_img_max_regions", "KTE_PDF_IMAGE_MAX_REGIONS", 4))
+
+    os.environ["KTE_PDF_IMAGE_MODE"] = mode
+    os.environ["KTE_PDF_IMAGE_MIN_AREA"] = str(min_area)
+    os.environ["KTE_PDF_IMAGE_MAX_REGIONS"] = str(max_regions)
+    
+    
+    # Vision backend/model (used when mode is vision/auto)
+    vb = (st.session_state.get("vision_backend") or os.getenv("KTE_VISION_BACKEND", "openai")).strip().lower()
+    vm = (st.session_state.get("vision_model") or os.getenv("KTE_VISION_MODEL", "")).strip()
+    if not vm:
+        vm = "gpt-4o" if vb == "openai" else "gemma3:4b"
+    os.environ["KTE_VISION_BACKEND"] = vb
+    os.environ["KTE_VISION_MODEL"] = vm
+
+
+def _apply_advanced_rag_settings_from_state() -> None:
+    """Apply chunking / RAG / context settings (UI -> env vars) so kte_proposal.py can read them."""
+    def _i(key: str, default: int) -> int:
+        # Prefer session_state, otherwise env var (KTE_*) if already set
+        try:
+            raw = st.session_state.get(key, os.getenv(key.upper(), default))
+            return int(str(raw).strip())
+        except Exception:
+            return int(default)
+
+    os.environ["KTE_CHUNK_SIZE"] = str(_i("kte_chunk_size", 800))
+    os.environ["KTE_CHUNK_OVERLAP"] = str(_i("kte_chunk_overlap", 80))
+    os.environ["KTE_RAG_K"] = str(_i("kte_rag_k", 6))
+    os.environ["KTE_RAG_PER_DOC_CHARS"] = str(_i("kte_rag_per_doc_chars", 1200))
+    os.environ["KTE_RAG_MAX_CHARS"] = str(_i("kte_rag_max_chars", 6000))
+    os.environ["KTE_OLLAMA_NUM_CTX"] = str(_i("kte_ollama_num_ctx", 4096))
+    os.environ["KTE_MAX_OUTPUT_TOKENS"] = str(_i("kte_max_output_tokens", 1024))
+
+
 def generate_kte_wrapper(file_path: str, backend: str, model_name: str, use_hyde: bool) -> Dict[str, Any]:
     """Call user's generator if available; otherwise raise a helpful error."""
     # Pass settings to user's code via env vars, if they choose to read them
     os.environ["KTE_BACKEND"] = backend
     os.environ["KTE_USE_HYDE"] = "1" if use_hyde else "0"
+    
+    
+    # UI-controlled PDF image handling (none|auto|ocr|vision)
+    _apply_pdf_image_settings_from_state()
+    _apply_advanced_rag_settings_from_state()
+    
     # Optional embedding model override from the UI
     if embed_model_override := st.session_state.get("embed_model_override", None):
         os.environ["KTE_EMBED_MODEL"] = embed_model_override
+
+    # Optional embedding fallback model from the UI
+    if embed_fallback_model := st.session_state.get("embed_fallback_model", None):
+        os.environ["KTE_EMBED_FALLBACK_MODEL"] = embed_fallback_model
 
     # Normalize to registry key if the user typed underlying name
     model_key = model_name
@@ -354,18 +437,36 @@ ALLOWED_FIELDS = [
 ]
 
 def _resolve_model_name_and_backend(model_key: str, chosen_backend: str) -> tuple[str,str]:
-    """Map your UI model_key to the underlying model name. Fall back to (model_key, chosen_backend)."""
     backend = chosen_backend
     name = model_key
     try:
         from kte_proposal import LLM_LIST  # your registry
         if model_key in LLM_LIST:
             cfg = LLM_LIST[model_key]
-            backend = "OpenAI" if cfg.get("type") == "openai" else "Ollama"
+            # Use the registry’s backend field
+            reg_backend = str(cfg.get("backend", "")).lower()
+            if reg_backend == "openai":
+                backend = "OpenAI"
+            elif reg_backend == "ollama":
+                backend = "Ollama"
             name = str(cfg.get("name", model_key))
     except Exception:
         pass
     return name, backend
+
+def _ollama_resp_text(resp) -> str:
+    """Handle both dict-style and pydantic-object responses from ollama-python."""
+    try:
+        if hasattr(resp, "message") and hasattr(resp.message, "content"):
+            return (resp.message.content or "").strip()
+    except Exception:
+        pass
+    try:
+        if isinstance(resp, dict):
+            return ((resp.get("message") or {}).get("content") or "").strip()
+    except Exception:
+        pass
+    return ""
 
 def _chat_llm(messages: list[dict], backend: str, model_key: str) -> str:
     """Call OpenAI or Ollama based on the UI/backend selection."""
@@ -379,6 +480,7 @@ def _chat_llm(messages: list[dict], backend: str, model_key: str) -> str:
                 model=model_name,
                 messages=messages,
                 temperature=0.2,
+                max_tokens=int(st.session_state.get("kte_max_output_tokens", os.getenv("KTE_MAX_OUTPUT_TOKENS", "1024")))
             )
             return resp.choices[0].message.content or ""
         except Exception as e:
@@ -387,8 +489,17 @@ def _chat_llm(messages: list[dict], backend: str, model_key: str) -> str:
     # Ollama (local)
     try:
         import ollama
-        resp = ollama.chat(model=model_name, messages=messages)
-        return (resp.get("message") or {}).get("content", "")
+
+        resp = ollama.chat(
+            model=model_name,
+            messages=messages,
+            options={
+                "num_ctx": int(st.session_state.get("kte_ollama_num_ctx", os.getenv("KTE_OLLAMA_NUM_CTX", "4096"))),
+                "num_predict": int(st.session_state.get("kte_max_output_tokens", os.getenv("KTE_MAX_OUTPUT_TOKENS", "1024"))),
+            },
+        )
+        return _ollama_resp_text(resp)
+    
     except Exception as e:
         return f"[Ollama error] {e}"
 
@@ -432,6 +543,34 @@ def _apply_updates(kte: dict, updates: dict) -> tuple[dict, list[str]]:
     new_kte = clamp_results(new_kte)
     return new_kte, changed
 
+
+def _is_title_like_query(q: str) -> bool:
+    t = (q or "").strip().lower()
+    # English + Persian (expand as needed)
+    keys = [
+        "title", "paper title", "article title",
+        "authors", "author list",
+        "doi", "journal", "year",
+        "عنوان", "عنوان مقاله", "نام مقاله", "نویسندگان", "doi"
+    ]
+    return any(k in t for k in keys)
+
+def _front_page_docs():
+    # Uses your already-built chunks; safest + fastest
+    chunks = st.session_state.get("article_chunks") or []
+    front = [d for d in chunks if d.metadata.get("page") in (0, 1)]
+    return front[:10] if front else chunks[:10]
+
+def _dedupe_docs(docs):
+    out, seen = [], set()
+    for d in docs or []:
+        pid = (d.metadata or {}).get("pid") or d.page_content[:80]
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(d)
+    return out
+
 def show_chat_editor():
     """Render the chat UI if a KTE dict is present in session state."""
     if "kte" not in st.session_state:
@@ -448,14 +587,17 @@ def show_chat_editor():
                 "You are KTE-Editor. You revise fields of the KTE form.\n"
                 "Answer briefly, then output a JSON patch like:\n"
                 '{"reply":"...", "updates":{"title":"...","nontech_results":"..."}}\n'
-                "Only include fields you change. Keep within length limits and use [P##] citations when relevant."
+                "Only include fields you change. Keep within length limits.\n"
+                "If you cite sources, cite ONLY IDs that appear in CONTEXT (e.g., [P0007]). "
+                "Never invent citations."
             )
         else:
             # Q&A mode — just answer; do NOT output JSON unless explicitly asked
             sys_content = (
                 "You are a helpful research assistant. Answer the user's question succinctly "
                 "using the provided CONTEXT and CURRENT_KTE_JSON when helpful. "
-                "Do NOT output JSON unless explicitly asked; just answer."
+                "If you cite sources, cite ONLY IDs that appear in CONTEXT (e.g., [P0007]). "
+                "Never invent citations. Do NOT output JSON unless explicitly asked; just answer."
             )
         st.session_state.chat_messages = [{"role": "system", "content": sys_content}]
 
@@ -478,17 +620,30 @@ def show_chat_editor():
 
     # ----- Conversational RAG: retrieve context for this user turn -----
     rag_context = ""
+    docs = []
+    hypothetical = None
+    qry_used = prompt
+    
     if st.session_state.get("use_rag_in_chat") and st.session_state.get("retriever"):
         try:
             # Build the query string for retrieval
             qry = prompt
 
             # Optional HyDE expansion (per-turn, only if enabled)
-            if st.session_state.get("use_hyde_in_chat"):
+            
+            is_title_like = _is_title_like_query(prompt)
+            use_hyde_this_turn = bool(st.session_state.get("use_hyde_in_chat")) and not is_title_like
+
+            if use_hyde_this_turn:
                 # Use the current chat backend/model to draft a hypothetical answer
                 # (This is the “HyDE” doc we’ll embed + search with)
                 hyde_sys = {"role": "system", "content": (
-                    "Write a concise, neutral paragraph that could plausibly appear in the manuscript and answer the user's question."
+                    "Write ONE concise, keyword-rich paragraph that could plausibly appear in the paper and answer the user's question.\n"
+                    "Rules:\n"
+                    "- Do NOT ask the user for the paper/text.\n"
+                    "- Do NOT say you lack access / need more context.\n"
+                    "- Do NOT use placeholders.\n"
+                    "- Include concrete domain terms/entities likely to appear in the manuscript."
                 )}
                 hyde_user = {"role": "user", "content": prompt}
 
@@ -501,14 +656,70 @@ def show_chat_editor():
                 qry = f"{prompt}\n\n{hypothetical}"
 
             # Retrieve with (possibly) expanded query
-            docs = st.session_state.retriever.get_relevant_documents(qry)
+            qry_used = qry
+            
+            desired_k = int(st.session_state.get("kte_rag_k", os.getenv("KTE_RAG_K", "6")))
+            raw_k = max(desired_k * 3, desired_k)  # over-fetch to survive dedupe
+            raw_docs = []
+            try:
+                vs = getattr(st.session_state.retriever, "vectorstore", None)
+                if vs is not None and hasattr(vs, "similarity_search"):
+                    raw_docs = vs.similarity_search(qry_used, k=raw_k)
+                else:
+                    # Fallback: temporarily bump retriever k
+                    try:
+                        st.session_state.retriever.search_kwargs["k"] = raw_k
+                    except Exception:
+                        pass
+                    raw_docs = st.session_state.retriever.get_relevant_documents(qry_used)
+            except Exception:
+                raw_docs = st.session_state.retriever.get_relevant_documents(qry_used)
 
-            rag_context = "\n\n---\n".join(
-                d.page_content.strip()[:1200] for d in docs if d and getattr(d, "page_content", None)
-            )[:4000]  # cap to keep tokens in check
+            docs = _dedupe_docs(raw_docs)[:desired_k]
+            
+            # Title-like questions: pin front matter so we don't retrieve license/footer pages
+            if _is_title_like_query(prompt):
+                pinned = _front_page_docs()
+                # Optional: drop common license/footer noise when user asks for title
+                docs = [d for d in docs if "creativecommons" not in (d.page_content or "").lower()]
+                docs = _dedupe_docs(pinned + docs)
+            
+            
+            rag_context = format_context(
+                docs,
+                per_doc_chars=int(st.session_state.get("kte_rag_per_doc_chars", os.getenv("KTE_RAG_PER_DOC_CHARS", "1200"))),
+                max_chars=int(st.session_state.get("kte_rag_max_chars", os.getenv("KTE_RAG_MAX_CHARS", "6000"))),
+            )  # cap to keep tokens in check
         except Exception as e:
             rag_context = f"(retrieval failed: {e})"
-
+            
+    # ---- Debug expander (essential) ----
+    try:
+        retrieved_view = []
+        for d in (docs or []):
+            meta = d.metadata or {}
+            retrieved_view.append({
+                "pid": meta.get("pid"),
+                "page": (meta.get("page") + 1) if isinstance(meta.get("page"), int) else meta.get("page"),
+                "snippet": (d.page_content or "")[:250],
+            })
+        debug_payload = {
+            "use_rag": bool(st.session_state.get("use_rag_in_chat")),
+            "use_hyde": bool(st.session_state.get("use_hyde_in_chat")),
+            "k_requested": int(st.session_state.get("kte_rag_k", os.getenv("KTE_RAG_K", "6"))),
+            "k_returned": len(docs or []),
+            "k_unique": len({((d.metadata or {}).get("pid") or "") for d in (docs or [])}),
+            "prompt": prompt,
+            "qry_used": qry_used,
+            "hyde": hypothetical,
+            "retrieved": retrieved_view,
+        }
+        st.session_state.last_rag_debug = debug_payload
+        with st.expander("Debug: retrieval context & citations", expanded=False):
+            st.json(debug_payload)
+            st.text_area("RAG context (what the model sees)", rag_context or "", height=260)
+    except Exception:
+        pass
     # Append user message
     st.session_state.chat_messages.append({"role":"user","content":prompt})
 
@@ -525,6 +736,8 @@ def show_chat_editor():
             "content": (
                 "You are KTE-Editor. Use ONLY the provided CONTEXT when changing fields. "
                 "If a fact is not in context, write 'گزارش نشده'.\n\n"
+                "If you cite sources, cite ONLY IDs that appear in CONTEXT (e.g., [P0007]). "
+                "Never invent citations.\n\n"
                 f"CONTEXT:\n{rag_context or '(no context)'}\n\n"
                 f"CURRENT_KTE_JSON:\n{kte_json}\n\n"
                 f"USER_REQUEST:\n{prompt}\n\n"
@@ -541,6 +754,8 @@ def show_chat_editor():
                 "Answer the following question using the CONTEXT. "
                 "If the answer is not present, say 'نامشخص/گزارش نشده'. "
                 "Keep it concise and helpful.\n\n"
+                "If you cite sources, cite ONLY IDs that appear in CONTEXT (e.g., [P0007]). "
+                "Never invent citations.\n\n"
                 f"CONTEXT:\n{rag_context or '(no context)'}\n\n"
                 f"CURRENT_KTE_JSON:\n{kte_json}\n\n"
                 f"QUESTION:\n{prompt}"
@@ -563,6 +778,30 @@ def show_chat_editor():
 
             # NEW (include prior messages, which already live in session_state)
             out = _chat_llm(st.session_state.chat_messages + [user], backend=backend, model_key=modelkey)
+            
+            # If the model produced citations, ensure they're REAL (only from retrieved CONTEXT).
+            # Repair once automatically if invalid citations appear.
+            try:
+                ok, cited, invalid, valid = validate_citations(out, docs)
+                out = sanitize_citations(out, valid)
+                if (not ok) and cited:
+                    allowed = ", ".join(sorted(valid)) if valid else "(none)"
+                    repair_user = dict(user)
+                    repair_user["content"] = (
+                        "Your previous answer contained citations that do not exist in the provided CONTEXT.\n"
+                        f"Only cite from: {allowed}\n"
+                        "Never invent citations. If not present, say 'نامشخص/گزارش نشده'.\n\n"
+                        + user["content"]
+                    )
+                    out = _chat_llm(st.session_state.chat_messages + [repair_user], backend=backend, model_key=modelkey)
+                    
+                    try:
+                        _, _, _, valid2 = validate_citations(out, docs)
+                        out = sanitize_citations(out, valid2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         
         # Q&A vs Edit mode
@@ -691,6 +930,105 @@ else:
 use_hyde = st.checkbox("Use HyDE (Hypothetical Document Expansion)", value=True)
 font_hint = st.text_input("Persian font TTF path (optional)", value="fonts/Vazirmatn-Regular.ttf")
 embed_model_override = st.text_input("Embedding model (optional)", value="")
+embed_fallback_model = st.text_input("Embedding fallback model (optional)", value=os.getenv("KTE_EMBED_FALLBACK_MODEL",""))
+
+
+
+# ---- PDF image handling controls (optional) ----
+with st.expander("PDF image handling (optional)", expanded=False):
+    st.caption(
+        "If your PDF has tables/figures as images, you can extract them into the text pipeline.\n"
+        "- none: ignore images\n"
+        "- ocr: use Tesseract (local) if available\n"
+        "- vision: use a vision model (OpenAI or Ollama) to read images\n"
+        "- auto: try vision if available, otherwise OCR"
+    )
+
+    _mode_choices = ["none", "auto", "ocr", "vision"]
+    _mode_default = (os.getenv("KTE_PDF_IMAGE_MODE", "none") or "none").strip().lower()
+    if _mode_default not in set(_mode_choices):
+        _mode_default = "none"
+
+    st.selectbox(
+        "Image mode",
+        _mode_choices,
+        index=_mode_choices.index(_mode_default),
+        key="pdf_img_mode",
+        help="Controls how image regions in the PDF are handled during ingestion."
+    )
+
+    try:
+        _min_default = float(os.getenv("KTE_PDF_IMAGE_MIN_AREA", "0.08"))
+    except Exception:
+        _min_default = 0.08
+    st.slider(
+        "Min image area (fraction of page)",
+        min_value=0.01, max_value=0.30,
+        value=float(_min_default),
+        step=0.01,
+        key="pdf_img_min_area",
+        help="Only image regions larger than this fraction of the page are extracted."
+    )
+
+    try:
+        _maxr_default = int(os.getenv("KTE_PDF_IMAGE_MAX_REGIONS", "4"))
+    except Exception:
+        _maxr_default = 4
+    st.number_input(
+        "Max image regions per page",
+        min_value=1, max_value=10,
+        value=int(_maxr_default),
+        step=1,
+        key="pdf_img_max_regions",
+        help="Caps how many large image regions per page are processed."
+    )
+    
+    # --- NEW: Vision backend selector (UI-controlled) ---
+    if st.session_state.get("pdf_img_mode") in {"vision", "auto"}:
+        st.selectbox(
+            "Vision backend",
+            ["openai", "ollama"],
+            index=0 if (os.getenv("KTE_VISION_BACKEND", "openai").strip().lower() != "ollama") else 1,
+            key="vision_backend",
+            help="Where image-reading runs. Ollama requires a vision-capable model (e.g., gemma3:4b)."
+        )
+        vb = (st.session_state.get("vision_backend") or "openai").strip().lower()
+        default_vm = "gpt-4o" if vb == "openai" else "gemma3:4b"
+        st.text_input(
+            "Vision model",
+            value=(os.getenv("KTE_VISION_MODEL", "") or default_vm),
+            key="vision_model",
+            help="OpenAI example: gpt-4o | Ollama example: gemma3:4b"
+        )
+
+# Apply immediately so BOTH generation and the chat retriever ingestion use the same settings.
+_apply_pdf_image_settings_from_state()
+
+
+
+# ---- Advanced chunking / retrieval / context controls (optional) ----
+with st.expander("Advanced: chunking & RAG size", expanded=False):
+    st.caption("These settings affect BOTH the KTE extraction and the Q&A chat retriever.")
+    st.slider("Chunk size (chars)", 200, 2500, int(os.getenv("KTE_CHUNK_SIZE", "800")), 50, key="kte_chunk_size")
+    st.slider("Chunk overlap (chars)", 0, 400, int(os.getenv("KTE_CHUNK_OVERLAP", "80")), 10, key="kte_chunk_overlap")
+    st.slider("Top-K retrieved chunks", 1, 12, int(os.getenv("KTE_RAG_K", "6")), 1, key="kte_rag_k")
+    st.slider("Per-chunk context cap (chars)", 200, 4000, int(os.getenv("KTE_RAG_PER_DOC_CHARS", "1200")), 100, key="kte_rag_per_doc_chars")
+    st.slider("Total context cap (chars)", 1000, 20000, int(os.getenv("KTE_RAG_MAX_CHARS", "6000")), 500, key="kte_rag_max_chars")
+    st.slider("Ollama context window num_ctx", 512, 16384, int(os.getenv("KTE_OLLAMA_NUM_CTX", "4096")), 256, key="kte_ollama_num_ctx")
+    st.slider("Max output tokens (num_predict / max_tokens)", 128, 4096, int(os.getenv("KTE_MAX_OUTPUT_TOKENS", "1024")), 64, key="kte_max_output_tokens")
+
+_apply_advanced_rag_settings_from_state()
+
+
+# If a retriever already exists (from a previous "Generate & Evaluate"),
+# update its k immediately so chat respects the slider without requiring a re-run.
+if st.session_state.get("retriever"):
+    try:
+        st.session_state.retriever.search_kwargs["k"] = int(
+            st.session_state.get("kte_rag_k", os.getenv("KTE_RAG_K", "6"))
+        )
+    except Exception:
+        pass
 
 use_rag_in_chat = st.checkbox(
     "Use RAG in chat", value=True,
@@ -785,6 +1123,10 @@ with col2:
 if embed_model_override:
     st.session_state["embed_model_override"] = embed_model_override
 
+# keep embed fallback model in session for wrapper access
+if embed_fallback_model:
+    st.session_state["embed_fallback_model"] = embed_fallback_model
+
 run = st.button("Generate & Evaluate")
 
 if run:
@@ -809,10 +1151,13 @@ if run:
             # ---- Build a retriever for chat from this very manuscript (only if enabled) ----
             if use_rag_in_chat:
                 try:
+                    # Use the same ingestion settings for the chat retriever, too
+                    _apply_pdf_image_settings_from_state()
                     raw_docs = load_document(doc_path)
-                    chunks   = split_sections(raw_docs)
+                    chunks   = assign_pids(split_sections(raw_docs))
                     vectordb = build_vectordb(chunks)
-                    st.session_state.retriever = vectordb.as_retriever(search_kwargs={"k": 6})
+                    
+                    st.session_state.retriever = vectordb.as_retriever(search_kwargs={"k": int(st.session_state.get("kte_rag_k", os.getenv("KTE_RAG_K", "6")))})
                     st.session_state.article_chunks = chunks
                 except Exception as e:
                     st.session_state.retriever = None
